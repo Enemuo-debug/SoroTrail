@@ -4,6 +4,7 @@
 // With no arguments it runs the indexer. Subcommands cover maintenance:
 //
 //	sorotrail replay --from-ledger N [--to-ledger M]
+//	sorotrail backfill --contract C... --from-ledger N [--to-ledger M]
 package main
 
 import (
@@ -16,7 +17,6 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -31,6 +31,16 @@ import (
 	"github.com/khaylebfortune/sorotrail/internal/store"
 	"github.com/khaylebfortune/sorotrail/internal/version"
 	"github.com/khaylebfortune/sorotrail/internal/webhook"
+	"github.com/sorotrail/sorotrail/internal/api"
+	"github.com/sorotrail/sorotrail/internal/audit"
+	"github.com/sorotrail/sorotrail/internal/broadcast"
+	"github.com/sorotrail/sorotrail/internal/config"
+	"github.com/sorotrail/sorotrail/internal/decode"
+	"github.com/sorotrail/sorotrail/internal/ingester"
+	"github.com/sorotrail/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/spec"
+	"github.com/sorotrail/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/webhook"
 )
 
 func main() {
@@ -58,6 +68,8 @@ func dispatch(args []string) error {
 		fmt.Printf("sorotrail %s (commit: %s, date: %s)\n",
 			version.GetVersion(), version.GetCommit(), version.GetDate())
 		return nil
+	case "backfill":
+		return runBackfill(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -76,6 +88,8 @@ subcommands:
   replay    re-decode stored events with the current decoder
             (sorotrail replay --help)
   version   print version information
+  backfill  ingest historical contract events from Horizon
+            (sorotrail backfill --help)
 `)
 }
 
@@ -90,22 +104,35 @@ func run() error {
 		"commit", version.GetCommit(),
 		"date", version.GetDate())
 
+	log.Info("startup configuration", cfg.LoggableFields()...)
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	if err := store.Migrate(cfg.DatabaseURL); err != nil {
 		return err
 	}
-	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
-	if err != nil {
-		return fmt.Errorf("connecting to postgres: %w", err)
-	}
-	defer pool.Close()
-	if err := pool.Ping(ctx); err != nil {
-		return fmt.Errorf("pinging postgres: %w", err)
-	}
 
-	st := store.NewPostgres(pool, int64(cfg.PartitionLedgerSpan))
+	var (
+		st   store.Store
+		pool *pgxpool.Pool
+	)
+	if strings.HasPrefix(cfg.DatabaseURL, "clickhouse://") {
+		st, err = store.NewStoreFromURL(cfg.DatabaseURL)
+		if err != nil {
+			return err
+		}
+	} else {
+		pool, err = pgxpool.New(ctx, cfg.DatabaseURL)
+		if err != nil {
+			return fmt.Errorf("connecting to postgres: %w", err)
+		}
+		defer pool.Close()
+		if err := pool.Ping(ctx); err != nil {
+			return fmt.Errorf("pinging postgres: %w", err)
+		}
+		st = store.NewPostgres(pool, int64(cfg.PartitionLedgerSpan))
+	}
 	for _, id := range cfg.WatchedContracts {
 		if err := st.AddWatchedContract(ctx, id); err != nil {
 			return err
@@ -113,6 +140,7 @@ func run() error {
 	}
 
 	rpcClient := rpc.NewHTTPClient(cfg.RPCURL)
+	bcast := broadcast.New(broadcast.DefaultBufferSize)
 	// Webhook delivery runs alongside ingestion — the notifier is attached
 	// to the ingester so events flow to subscriber callbacks asynchronously.
 	wh := webhook.NewNotifier(st, log)
@@ -122,8 +150,13 @@ func run() error {
 	specFetcher := spec.NewFetcher(rpcClient)
 	specEnricher := spec.NewEnricher(specFetcher, specCache, log)
 
-	bcast := broadcast.New(broadcast.DefaultBufferSize)
-	ing := ingester.New(rpcClient, st, decode.XDRDecoder{}, log, ingester.Options{
+	// Wrap the raw RPC client so per-method error totals are tracked and
+	// surfaced via /stats. specFetcher already holds a reference to the
+	// unwrapped client (spec lookups are not counted as ingestion errors).
+	countingClient := rpc.NewCountingClient(rpcClient)
+	api.SetRPCCounter(countingClient)
+
+	ing := ingester.New(countingClient, st, decode.XDRDecoder{}, log, ingester.Options{
 		PollInterval:     cfg.PollInterval,
 		StartLedger:      cfg.StartLedger,
 		RetentionLedgers: cfg.RetentionLedgers,
@@ -139,7 +172,7 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		auditClient := audit.NewBudgetedClient(rpcClient, budget)
+		auditClient := audit.NewBudgetedClient(countingClient, budget)
 		aud = audit.New(auditClient, st, ing, log, audit.Options{
 			PollInterval:      cfg.AuditPollInterval,
 			BatchLedgers:      cfg.AuditBatchLedgers,
@@ -159,13 +192,27 @@ func run() error {
 	limiter.Start(ctx)
 	defer limiter.Stop()
 
-	apiServer := api.New(st, rpcClient, log, specEnricher).WithBroadcaster(bcast)
+	apiStore := store.NewGuardedStore(st, store.GuardedStoreOptions{
+		Timeout:            cfg.APIQueryTimeout,
+		SlowQueryThreshold: cfg.APISlowQueryThreshold,
+		Logger:             log,
+	})
+	apiServer := api.New(apiStore, countingClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
+	apiServer.SetCompressMinSize(cfg.CompressMinSize)
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           apiServer.Router(),
-		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       cfg.HTTPReadTimeout,
+		WriteTimeout:      cfg.HTTPWriteTimeout,
+		IdleTimeout:       cfg.HTTPIdleTimeout,
+		ReadHeaderTimeout: cfg.HTTPReadHeaderTimeout,
+	}
+	if cfg.APIKey == "" {
+		log.Warn("API_KEY env is unset; watched-contracts endpoints will reject every request with 503")
+	} else {
+		log.Info("watched-contracts endpoints are auth-gated")
 	}
 
 	errCh := make(chan error, 4)
@@ -216,7 +263,7 @@ func run() error {
 		stop() // one component failed; wind down the others
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Error("http shutdown", "error", err)
